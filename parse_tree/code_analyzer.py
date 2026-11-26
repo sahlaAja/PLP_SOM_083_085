@@ -33,8 +33,12 @@ class SemanticAnalyzer:
 
         # Definisi kelas: nama_kelas -> set atribut yang di-assign via self.<attr>
         self.class_attrs: dict[str, set[str]] = {}
+        # Tipe atribut kelas hasil inferensi Pass 1: nama_kelas -> {nama_attr: tipe}
+        self.class_attr_types: dict[str, dict[str, str]] = {}
         # Definisi method kelas: nama_kelas -> set nama method dalam class
         self.class_methods: dict[str, set[str]] = {}
+        # Signature parameter fungsi/method (tanpa self): nama -> [(param, tipe)]
+        self.func_params: dict[str, list[tuple[str, str]]] = {}
         # Definisi fungsi/method: nama -> return_type annotation (jika ada)
         self.func_return_types: dict[str, str | None] = {}
         # Scope stack: list of dict[nama_variabel, tipe_perkiraan]
@@ -70,42 +74,108 @@ class SemanticAnalyzer:
     def add_issue(self, category: str, message: str, node):
         self.issues.append(Issue(category, message, posisi(node), node.type))
 
-    # --- Pass 1: Kumpulkan definisi class, atribut self.*, method, dan fungsi global ---
-    def collect_definitions(self, node, active_class: str | None = None):
+    def extract_params(self, params_node) -> list[tuple[str, str]]:
+        hasil: list[tuple[str, str]] = []
+        if not params_node:
+            return hasil
+        for p in params_node.named_children:
+            if p.type == "identifier":
+                hasil.append((teks(p, self.sumber), "unknown"))
+            elif p.type in ("typed_parameter", "typed_default_parameter"):
+                p_ident = p.child_by_field_name("name") or next(
+                    (c for c in p.named_children if c.type == "identifier"), None
+                )
+                p_type = p.child_by_field_name("type")
+                if p_ident:
+                    hasil.append((teks(p_ident, self.sumber), teks(p_type, self.sumber) if p_type else "unknown"))
+            elif p.type == "default_parameter":
+                p_ident = p.child_by_field_name("name")
+                if p_ident:
+                    hasil.append((teks(p_ident, self.sumber), "unknown"))
+        return hasil
+
+    def types_compatible(self, expected: str | None, actual: str) -> bool:
+        if not expected or expected == "unknown" or actual == "unknown":
+            return True
+        if expected == actual:
+            return True
+        if expected == "float" and actual == "int":
+            return True
+        return False
+
+    # --- Pass 1: Kumpulkan definisi class, atribut & tipenya, method, parameter, dan return type ---
+    def collect_definitions(self, node, active_class: str | None = None, param_types: dict[str, str] | None = None):
         if node.type == "class_definition":
             name_node = node.child_by_field_name("name")
             cname = teks(name_node, self.sumber) if name_node else "<unknown>"
             self.class_attrs.setdefault(cname, set())
+            self.class_attr_types.setdefault(cname, {})
             self.class_methods.setdefault(cname, set())
             if active_class is None:
                 self.scopes[0][cname] = "type"
             for ch in node.named_children:
-                self.collect_definitions(ch, cname)
+                self.collect_definitions(ch, cname, None)
             return
 
         if node.type == "function_definition":
             name_node = node.child_by_field_name("name")
             ret_node = node.child_by_field_name("return_type")
+            params_node = node.child_by_field_name("parameters")
             fname = teks(name_node, self.sumber) if name_node else "<unknown>"
             full_name = f"{active_class}.{fname}" if active_class else fname
+
+            params = self.extract_params(params_node)
+            self.func_params[full_name] = [
+                (pname, ptype) for pname, ptype in params if not (active_class and pname == "self")
+            ]
             self.func_return_types[full_name] = teks(ret_node, self.sumber) if ret_node else None
+
             if active_class:
                 self.class_methods.setdefault(active_class, set()).add(fname)
             else:
                 self.scopes[0][fname] = "function"
 
+            local_param_types = {pname: ptype for pname, ptype in params}
+            body = node.child_by_field_name("body")
+            if body:
+                self.collect_definitions(body, active_class, local_param_types)
+            return
+
         if node.type in ("assignment", "augmented_assignment") and active_class:
             left = node.child_by_field_name("left")
+            right = node.child_by_field_name("right")
             if left and left.type == "attribute":
                 obj = left.child_by_field_name("object")
                 attr = left.child_by_field_name("attribute")
                 if obj and attr and teks(obj, self.sumber) == "self":
-                    self.class_attrs[active_class].add(teks(attr, self.sumber))
+                    attr_name = teks(attr, self.sumber)
+                    self.class_attrs[active_class].add(attr_name)
+                    inferred = self._infer_simple_rhs(right, param_types or {})
+                    if inferred != "unknown":
+                        self.class_attr_types[active_class][attr_name] = inferred
 
         for ch in node.named_children:
-            self.collect_definitions(ch, active_class)
+            self.collect_definitions(ch, active_class, param_types)
 
-    # --- Inferensi tipe sederhana dari node CST ---
+    def _infer_simple_rhs(self, node, param_types: dict[str, str]) -> str:
+        if node is None:
+            return "unknown"
+        literal_map = {
+            "integer": "int",
+            "float": "float",
+            "string": "str",
+            "concatenated_string": "str",
+            "list": "list",
+            "dictionary": "dict",
+            "none": "None",
+        }
+        if node.type in literal_map:
+            return literal_map[node.type]
+        if node.type == "identifier":
+            return param_types.get(teks(node, self.sumber), "unknown")
+        return "unknown"
+
+    # --- Inferensi tipe dinamis dari node CST dan hasil Pass 1 ---
     def infer_type(self, node) -> str:
         if node is None:
             return "unknown"
@@ -131,36 +201,34 @@ class SemanticAnalyzer:
             attr = node.child_by_field_name("attribute")
             obj_type = self.infer_type(obj)
             attr_name = teks(attr, self.sumber) if attr else ""
-            if obj_type == "Product" and attr_name == "price":
-                return "float"
-            if obj_type == "Product" and attr_name == "product_id":
-                return "int"
-            if obj_type == "Product" and attr_name == "name":
-                return "str"
-            if obj_type == "Order" and attr_name == "total":
-                return "float"
-            if obj_type == "Order" and attr_name == "customer":
-                return "str"
-            return "unknown"
+            return self.class_attr_types.get(obj_type, {}).get(attr_name, "unknown")
         if t == "call":
             fn = node.child_by_field_name("function")
-            fn_text = teks(fn, self.sumber) if fn else ""
-            if fn_text in ("Product", "Order", "OrderService"):
-                return fn_text
-            if fn_text.endswith(".apply_discount") or fn_text.endswith(".calculate_tax"):
-                return "float"
-            if fn_text.endswith(".create_order"):
-                return "Order"
-            if fn_text == "calculate_bulk_price":
-                return "float"
+            if fn is None:
+                return "unknown"
+            if fn.type == "identifier":
+                fn_name = teks(fn, self.sumber)
+                if fn_name in self.class_attrs:
+                    return fn_name
+                return self.func_return_types.get(fn_name) or "unknown"
+            if fn.type == "attribute":
+                obj = fn.child_by_field_name("object")
+                attr = fn.child_by_field_name("attribute")
+                obj_type = self.infer_type(obj)
+                method_name = teks(attr, self.sumber) if attr else ""
+                return self.func_return_types.get(f"{obj_type}.{method_name}") or "unknown"
             return "unknown"
         if t == "binary_operator":
             left = node.child_by_field_name("left")
             right = node.child_by_field_name("right")
+            op_node = node.child_by_field_name("operator")
+            op = teks(op_node, self.sumber) if op_node else ""
             lt = self.infer_type(left)
             rt = self.infer_type(right)
             if "str" in (lt, rt):
                 return "str"
+            if op == "/" and lt in ("int", "float") and rt in ("int", "float"):
+                return "float"
             if "float" in (lt, rt):
                 return "float"
             if lt == "int" and rt == "int":
@@ -186,21 +254,10 @@ class SemanticAnalyzer:
             self.push_scope(f"def:{fname}")
 
             params = node.child_by_field_name("parameters")
-            if params:
-                for p in params.named_children:
-                    if p.type == "identifier":
-                        pname = teks(p, self.sumber)
-                        ptype = cname if (pname == "self" and cname) else "unknown"
-                        self.declare_var(pname, ptype)
-                    elif p.type == "typed_parameter":
-                        p_ident = p.child_by_field_name("name") or next(
-                            (c for c in p.named_children if c.type == "identifier"), None
-                        )
-                        p_type = p.child_by_field_name("type")
-                        if p_ident:
-                            pname = teks(p_ident, self.sumber)
-                            ptype = teks(p_type, self.sumber) if p_type else "unknown"
-                            self.declare_var(pname, ptype)
+            for pname, ptype in self.extract_params(params):
+                if pname == "self" and cname:
+                    ptype = cname
+                self.declare_var(pname, ptype)
 
             body = node.child_by_field_name("body")
             if body:
@@ -256,28 +313,30 @@ class SemanticAnalyzer:
         if t == "binary_operator":
             left = node.child_by_field_name("left")
             right = node.child_by_field_name("right")
+            op_node = node.child_by_field_name("operator")
             self.analyze(left, current_func)
             self.analyze(right, current_func)
 
-            op_text = teks(node, self.sumber)
+            op = teks(op_node, self.sumber) if op_node else ""
+            expr_text = teks(node, self.sumber)
             lt = self.infer_type(left)
             rt = self.infer_type(right)
 
-            # Cek operasi perkalian/pembagian/pengurangan dengan string
-            if any(op in op_text for op in [" * ", " / ", " - "]):
-                if lt == "str" or rt == "str":
+            # Cek operasi aritmetika (-, *, /, //, %) dengan string
+            if op in ("*", "/", "//", "-", "%"):
+                if (lt == "str" or rt == "str") and not (op == "*" and {lt, rt} == {"str", "int"}):
                     self.add_issue(
                         "TYPE",
-                        f"Operasi aritmetika '{op_text}' melibatkan tipe 'str' ({lt} vs {rt}).",
+                        f"Operasi aritmetika '{expr_text}' melibatkan tipe 'str' ({lt} {op} {rt}).",
                         node,
                     )
             # Cek penjumlahan '+' antara str dan numerik (int/float)
-            if " + " in op_text:
+            elif op == "+":
                 numeric = {"int", "float"}
                 if (lt == "str" and rt in numeric) or (rt == "str" and lt in numeric):
                     self.add_issue(
                         "TYPE",
-                        f"Penjumlahan '+' menggabungkan 'str' dan numerik: '{op_text}' ({lt} + {rt}).",
+                        f"Penjumlahan '+' menggabungkan 'str' dan numerik: '{expr_text}' ({lt} + {rt}).",
                         node,
                     )
             return
@@ -291,16 +350,34 @@ class SemanticAnalyzer:
                 for arg in args.named_children:
                     self.analyze(arg, current_func)
 
-            fn_text = teks(fn, self.sumber) if fn else ""
-            if fn_text.endswith(".calculate_tax") and args and args.named_children:
-                arg0 = args.named_children[0]
-                arg0_type = self.infer_type(arg0)
-                if arg0_type not in ("int", "float", "unknown"):
-                    self.add_issue(
-                        "TYPE",
-                        f"Pemanggilan '{teks(node, self.sumber)}' mengirim argumen '{teks(arg0, self.sumber)}' bertipe '{arg0_type}', diharapkan 'float'/'int'.",
-                        node,
-                    )
+            target_sig = None
+            if fn:
+                if fn.type == "identifier":
+                    fn_name = teks(fn, self.sumber)
+                    target_sig = f"{fn_name}.__init__" if fn_name in self.class_attrs else fn_name
+                elif fn.type == "attribute":
+                    obj = fn.child_by_field_name("object")
+                    attr = fn.child_by_field_name("attribute")
+                    obj_type = self.infer_type(obj)
+                    method_name = teks(attr, self.sumber) if attr else ""
+                    if obj_type != "unknown":
+                        target_sig = f"{obj_type}.{method_name}"
+
+            if target_sig and target_sig in self.func_params and args:
+                expected_params = self.func_params[target_sig]
+                positional_args = [a for a in args.named_children if a.type != "keyword_argument"]
+                for idx, arg_node in enumerate(positional_args):
+                    if idx >= len(expected_params):
+                        break
+                    pname, expected_type = expected_params[idx]
+                    actual_type = self.infer_type(arg_node)
+                    if not self.types_compatible(expected_type, actual_type):
+                        self.add_issue(
+                            "TYPE",
+                            f"Pemanggilan '{teks(node, self.sumber)}' mengirim argumen '{teks(arg_node, self.sumber)}' "
+                            f"bertipe '{actual_type}' untuk parameter '{pname}: {expected_type}'.",
+                            node,
+                        )
             return
 
         if t == "return_statement" and current_func:
@@ -309,10 +386,10 @@ class SemanticAnalyzer:
             if ret_expr:
                 self.analyze(ret_expr, current_func)
                 actual_ret = self.infer_type(ret_expr)
-                if expected_ret == "float" and actual_ret == "str":
+                if expected_ret and not self.types_compatible(expected_ret, actual_ret):
                     self.add_issue(
                         "TYPE",
-                        f"Return pada '{current_func}' menghasilkan '{actual_ret}' ('{teks(ret_expr, self.sumber)}'), padahal anotasi tipe '-> float'.",
+                        f"Return pada '{current_func}' menghasilkan '{actual_ret}' ('{teks(ret_expr, self.sumber)}'), padahal anotasi tipe '-> {expected_ret}'.",
                         node,
                     )
             return
@@ -360,7 +437,7 @@ class SemanticAnalyzer:
 
 def main():
     if len(sys.argv) < 2:
-        print("Penggunaan: python semantic_analyzer.py <path_file.py>")
+        print("Penggunaan: python parse_tree/code_analyzer.py <path_file.py>")
         sys.exit(1)
 
     target = Path(sys.argv[1])
