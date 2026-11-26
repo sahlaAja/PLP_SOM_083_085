@@ -33,6 +33,8 @@ class SemanticAnalyzer:
 
         # Definisi kelas: nama_kelas -> set atribut yang di-assign via self.<attr>
         self.class_attrs: dict[str, set[str]] = {}
+        # Definisi method kelas: nama_kelas -> set nama method dalam class
+        self.class_methods: dict[str, set[str]] = {}
         # Definisi fungsi/method: nama -> return_type annotation (jika ada)
         self.func_return_types: dict[str, str | None] = {}
         # Scope stack: list of dict[nama_variabel, tipe_perkiraan]
@@ -68,12 +70,15 @@ class SemanticAnalyzer:
     def add_issue(self, category: str, message: str, node):
         self.issues.append(Issue(category, message, posisi(node), node.type))
 
-    # --- Pass 1: Kumpulkan definisi class, atribut self.*, dan signature fungsi ---
+    # --- Pass 1: Kumpulkan definisi class, atribut self.*, method, dan fungsi global ---
     def collect_definitions(self, node, active_class: str | None = None):
         if node.type == "class_definition":
             name_node = node.child_by_field_name("name")
             cname = teks(name_node, self.sumber) if name_node else "<unknown>"
             self.class_attrs.setdefault(cname, set())
+            self.class_methods.setdefault(cname, set())
+            if active_class is None:
+                self.scopes[0][cname] = "type"
             for ch in node.named_children:
                 self.collect_definitions(ch, cname)
             return
@@ -84,6 +89,10 @@ class SemanticAnalyzer:
             fname = teks(name_node, self.sumber) if name_node else "<unknown>"
             full_name = f"{active_class}.{fname}" if active_class else fname
             self.func_return_types[full_name] = teks(ret_node, self.sumber) if ret_node else None
+            if active_class:
+                self.class_methods.setdefault(active_class, set()).add(fname)
+            else:
+                self.scopes[0][fname] = "function"
 
         if node.type in ("assignment", "augmented_assignment") and active_class:
             left = node.child_by_field_name("left")
@@ -312,7 +321,7 @@ class SemanticAnalyzer:
             name = teks(node, self.sumber)
             builtins_or_types = {
                 "print", "len", "range", "int", "float", "str", "list", "dict",
-                "ValueError", "Product", "Order", "OrderService", "__name__"
+                "ValueError", "__name__"
             }
             if name not in builtins_or_types and self.lookup_var(name) is None:
                 self.add_issue(
@@ -335,11 +344,11 @@ class SemanticAnalyzer:
         attr_name = teks(attr, self.sumber)
 
         if obj_type in self.class_attrs:
-            valid_attrs = self.class_attrs[obj_type]
-            if attr_name not in valid_attrs:
+            valid_members = self.class_attrs[obj_type] | self.class_methods.get(obj_type, set())
+            if attr_name not in valid_members:
                 self.add_issue(
                     "ATTRIBUTE",
-                    f"Atribut '{attr_name}' tidak ada pada definisi class '{obj_type}' (akses: '{teks(attr_node, self.sumber)}').",
+                    f"Atribut/method '{attr_name}' tidak ada pada definisi class '{obj_type}' (akses: '{teks(attr_node, self.sumber)}').",
                     attr_node,
                 )
 
